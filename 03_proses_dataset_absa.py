@@ -384,12 +384,21 @@ def proses_pipeline():
         rata_rata_rating=("rating_ulasan", "mean")
     ).round(2).reset_index()
 
+    def sanitize_for_excel(df_in: pd.DataFrame) -> pd.DataFrame:
+        """Mencegah karakter '=' atau '@' di awal teks ulasan memicu error formula di Excel."""
+        df_out = df_in.copy()
+        for col in df_out.select_dtypes(include=["object"]).columns:
+            df_out[col] = df_out[col].apply(
+                lambda x: re.sub(r"^[=@]+\s*", "", str(x)) if isinstance(x, str) and len(x) > 0 and x[0] in ["=", "@"] else x
+            )
+        return df_out
+
     # Tulis ke file Excel dengan beberapa sheet sekaligus
     print(f"⏳ Mengekspor ke Excel: '{OUTPUT_EXCEL}'...")
     with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl") as writer:
-        df_ulasan_sheet.to_excel(writer, sheet_name="ulasan", index=False)
-        df_kalimat.to_excel(writer, sheet_name="kalimat_aspek", index=False)
-        df_hotel_sheet.to_excel(writer, sheet_name="daftar_penginapan", index=False)
+        sanitize_for_excel(df_ulasan_sheet).to_excel(writer, sheet_name="ulasan", index=False)
+        sanitize_for_excel(df_kalimat).to_excel(writer, sheet_name="kalimat_aspek", index=False)
+        sanitize_for_excel(df_hotel_sheet).to_excel(writer, sheet_name="daftar_penginapan", index=False)
         df_stat_ringkas.to_excel(writer, sheet_name="stat_ringkas", index=False)
         df_stat_status_halal.to_excel(writer, sheet_name="stat_status_halal", index=False)
         df_stat_aspek.to_excel(writer, sheet_name="stat_aspek", index=False)
