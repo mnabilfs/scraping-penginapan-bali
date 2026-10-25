@@ -112,8 +112,19 @@ def bersihkan_teks(teks: str) -> str:
     if not isinstance(teks, str):
         return ""
     teks = re.sub(r"http\S+|www\S+", "", teks)
+    teks = re.sub(r"[\r\n]+", " ", teks)
     teks = re.sub(r"\s+", " ", teks).strip()
     return teks
+
+def clean_csv_cell(val) -> str:
+    """Membersihkan newline agar tidak memecah baris di CSV dan Excel."""
+    if val is None or pd.isna(val):
+        return ""
+    txt = str(val)
+    txt = re.sub(r"[\r\n]+", " ", txt)
+    txt = txt.replace("\t", " ")
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
 
 def deteksi_bahasa(teks: str) -> str:
     """Mendeteksi bahasa ulasan menggunakan langdetect."""
@@ -160,8 +171,12 @@ def proses_pipeline():
 
         nama_tempat = str(row.get("nama_penginapan") or h_info.get("nama_penginapan", ""))
         alamat = str(h_info.get("alamat", ""))
-        kategori = str(h_info.get("tipe", "Hotel"))
-        rating_tempat = h_info.get("rating_rata2")
+        raw_hotel_rat = row.get("rating_penginapan") if (pd.notnull(row.get("rating_penginapan")) and str(row.get("rating_penginapan")).strip() != "") else h_info.get("rating_rata2")
+        try:
+            rating_tempat = f"{float(raw_hotel_rat):.1f}" if pd.notnull(raw_hotel_rat) and str(raw_hotel_rat).strip() != "" else ""
+        except Exception:
+            rating_tempat = str(raw_hotel_rat) if pd.notnull(raw_hotel_rat) else ""
+
         total_ulasan_tempat = h_info.get("jumlah_ulasan_total", 0)
         harga = h_info.get("harga", "")
         telepon = h_info.get("telepon", "")
@@ -172,7 +187,11 @@ def proses_pipeline():
 
         review_id = str(row.get("review_id", ""))
         reviewer_total = row.get("reviewer_total_ulasan", 1)
-        rating_ulasan = row.get("rating_bintang", 5)
+        raw_star = row.get("rating_bintang", 5)
+        try:
+            rating_ulasan = f"{float(raw_star):.1f}" if pd.notnull(raw_star) and str(raw_star).strip() != "" else "5.0"
+        except Exception:
+            rating_ulasan = "5.0"
         tanggal_str = str(row.get("tanggal", ""))
         ulasan_asli = str(row.get("teks_ulasan", ""))
         likes = row.get("jumlah_like", 0)
@@ -231,6 +250,7 @@ def proses_pipeline():
             "kelompok_sampel": str(row.get("kelompok_sampel", "umum")),
             "kata_kunci": str(row.get("kata_kunci", "_umum")),
             "teks_terjemahan_google": str(row.get("teks_terjemahan_google", "")),
+            "rating_penginapan": row.get("rating_penginapan", rating_tempat),
             "ada_balasan_pemilik": row.get("ada_balasan_pemilik", False),
             "balasan_pemilik": str(row.get("balasan_pemilik", "")),
             "fasilitas": str(row.get("fasilitas", "")),
@@ -287,7 +307,10 @@ def proses_pipeline():
     for lc in label_cols:
         df_absa_csv[lc] = ""
 
-    # Simpan dataset CSV Tahap 3
+    # Simpan dataset CSV Tahap 3 (Pastikan setiap ulasan tepat 1 baris)
+    for col in df_absa_csv.columns:
+        if df_absa_csv[col].dtype == object:
+            df_absa_csv[col] = df_absa_csv[col].apply(clean_csv_cell)
     df_absa_csv.to_csv(OUTPUT_CSV, index=False, encoding="utf-8")
     print(f"✅ File CSV akhir tersimpan: {OUTPUT_CSV}")
 

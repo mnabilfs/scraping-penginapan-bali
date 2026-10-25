@@ -160,7 +160,7 @@ python 03_proses_dataset_absa.py
 ## 📊 Skema & Struktur Data
 
 ### 1. File Checkpoint Ulasan (`data/raw_ulasan_checkpoint.csv`)
-Terdiri dari 16 kolom:
+Terdiri dari 17 kolom (setiap baris ulasan dijamin tepat 1 baris tanpa enter berantakan):
 | No | Nama Kolom | Keterangan |
 |---|---|---|
 | 1 | `review_id` | Hash unik ulasan (kombinasi reviewer, tanggal, teks) |
@@ -169,16 +169,17 @@ Terdiri dari 16 kolom:
 | 4 | `kabupaten` | Kabupaten/Kota di Bali |
 | 5 | `kelompok_sampel` | Kelompok sampel (`syariah` / `umum`) |
 | 6 | `kata_kunci` | Kata kunci pencarian awal |
-| 7 | `fasilitas` | Fasilitas hotel (*Wi-Fi gratis, Sarapan, Kolam renang, dll.*) |
-| 8 | `teks_ulasan` | Teks ulasan asli pengunjung (sudah diperluas penuh) |
+| 7 | `fasilitas` | Fasilitas hotel (*Wi-Fi gratis, Sarapan, Kolam renang luar, AC, dll.*) |
+| 8 | `teks_ulasan` | Teks ulasan asli pengunjung (sudah diperluas penuh & dibersihkan enter-nya) |
 | 9 | `teks_terjemahan_google` | Terjemahan ulasan jika dalam bahasa asing |
-| 10 | `rating_bintang` | Rating ulasan pengunjung (1 - 5) |
-| 11 | `tanggal` | Teks tanggal ulasan asli di Google Maps (misal: "3 bulan lalu") |
-| 12 | `jumlah_like` | Jumlah like pada ulasan |
-| 13 | `ada_balasan_pemilik` | Boolean (`True` jika pemilik hotel membalas ulasan) |
-| 14 | `balasan_pemilik` | Teks lengkap respon / tanggapan dari pihak hotel |
-| 15 | `sumber` | Sumber data (`Google Maps`) |
-| 16 | `reviewer_total_ulasan` | Jumlah total kontribusi ulasan yang ditulis oleh reviewer |
+| 10 | `rating_penginapan` | Rating rata-rata keseluruhan penginapan dari ringkasan Google Maps berdesimal (*contoh: 4.4, 4.9*) |
+| 11 | `rating_bintang` | Rating bintang yang diberikan reviewer per ulasan berdesimal (*contoh: 5.0, 4.0, 1.0*) |
+| 12 | `tanggal` | Teks tanggal ulasan asli di Google Maps (*misal: "3 bulan lalu"*) |
+| 13 | `jumlah_like` | Jumlah like pada ulasan |
+| 14 | `ada_balasan_pemilik` | Boolean (`True` jika pemilik hotel memberikan tanggapan resmi) |
+| 15 | `balasan_pemilik` | Teks lengkap respon / tanggapan dari pihak hotel |
+| 16 | `sumber` | Sumber data (`Google Maps`) |
+| 17 | `reviewer_total_ulasan` | Jumlah total kontribusi ulasan yang ditulis oleh reviewer |
 
 ---
 

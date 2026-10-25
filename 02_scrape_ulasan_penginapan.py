@@ -36,16 +36,30 @@ OUTPUT_REVIEW_FILE = DATA_DIR / "raw_ulasan_checkpoint.csv"
 USER_DATA_DIR = DATA_DIR / "browser_profile"
 LOGIN_FLAG_FILE = USER_DATA_DIR / "login_completed.flag"
 
-# Kolom standar dataset ulasan (termasuk kolom fasilitas dan balasan_pemilik)
+# Kolom standar dataset ulasan (termasuk fasilitas, rating_penginapan, dan balasan_pemilik)
 CSV_COLUMNS = [
     "review_id", "data_id", "nama_penginapan", "kabupaten", "kelompok_sampel",
-    "kata_kunci", "fasilitas", "teks_ulasan", "teks_terjemahan_google", "rating_bintang",
+    "kata_kunci", "fasilitas", "teks_ulasan", "teks_terjemahan_google", "rating_penginapan", "rating_bintang",
     "tanggal", "jumlah_like", "ada_balasan_pemilik", "balasan_pemilik", "sumber", "reviewer_total_ulasan"
 ]
 
 def hash_review_id(text: str, author: str, date_str: str) -> str:
     seed = f"{author}_{date_str}_{text}".encode("utf-8")
     return hashlib.sha256(seed).hexdigest()[:24]
+
+def clean_csv_cell(val) -> str:
+    """
+    Membersihkan karakter enter/newline (\\r, \\n), tab, dan spasi berlebih
+    agar setiap teks ulasan, tanggal, dan balasan pemilik tersimpan tepat dalam 1 baris CSV.
+    Hal ini mencegah baris bergeser atau rusak saat file CSV dibuka atau diproses di Excel.
+    """
+    if val is None or pd.isna(val):
+        return ""
+    txt = str(val)
+    txt = re.sub(r"[\r\n]+", " ", txt)
+    txt = txt.replace("\t", " ")
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
 
 # Script JS untuk ekstraksi fasilitas penginapan (bagian 'Detail hotel')
 JS_EXTRACT_FACILITIES = r"""
@@ -158,9 +172,34 @@ JS_EXTRACT_REVIEWS = r"""
                 reviewText = revWi.innerText.trim();
             }
 
-            // 6. Likes
-            const likeEl = card.querySelector('button.GBkF3d');
-            const likes = likeEl ? likeEl.innerText.trim() : '0';
+            // 6. Likes (Tombol Suka / Upvote)
+            let likesCount = 0;
+            const likeBtn = card.querySelector('button[jsaction*="toggleThumbsUp"]') ||
+                            card.querySelector('button[aria-label*="suka" i]') ||
+                            card.querySelector('button[aria-label*="like" i]') ||
+                            card.querySelector('div.GBkF3d') ||
+                            card.querySelector('button.gllhef');
+            if (likeBtn) {
+                // Prioritas 1: span.pkWtMe spesifik (angka like resmi Google Maps)
+                const pkSpan = likeBtn.querySelector('span.pkWtMe') || card.querySelector('span.pkWtMe');
+                if (pkSpan && pkSpan.innerText.trim()) {
+                    const m = pkSpan.innerText.trim().match(/(\d+)/);
+                    if (m) likesCount = parseInt(m[1], 10);
+                }
+                // Prioritas 2: aria-label / title (contoh: "1 suka", "5 likes")
+                if (likesCount === 0) {
+                    const aria = ((likeBtn.getAttribute('aria-label') || '') + ' ' + (likeBtn.getAttribute('title') || '')).trim();
+                    const m = aria.match(/(\d+)/);
+                    if (m) likesCount = parseInt(m[1], 10);
+                }
+                // Prioritas 3: seluruh innerText pada likeBtn
+                if (likesCount === 0) {
+                    const txt = likeBtn.innerText || '';
+                    const m = txt.match(/(\d+)/);
+                    if (m) likesCount = parseInt(m[1], 10);
+                }
+            }
+            const likes = likesCount;
 
             // 7. Balasan Pemilik (Owner Response)
             const replyBlock = card.querySelector('div.CDe7pd');
@@ -199,12 +238,34 @@ JS_EXTRACT_REVIEWS = r"""
 """
 
 def migrate_checkpoint_schema():
-    """Pastikan checkpoint lama memiliki kolom 'balasan_pemilik' tanpa menghilangkan data."""
+    """Pastikan checkpoint lama memiliki kolom 'fasilitas', 'balasan_pemilik', 'rating_penginapan' serta format rating desimal."""
     if not OUTPUT_REVIEW_FILE.exists():
         return
     try:
         df = pd.read_csv(OUTPUT_REVIEW_FILE)
         changed = False
+
+        if "rating_penginapan" not in df.columns:
+            df["rating_penginapan"] = ""
+            changed = True
+
+        # Isi rating_penginapan dari data hotel jika masih kosong
+        if INPUT_HOTEL_FILE.exists():
+            df_hotels = pd.read_csv(INPUT_HOTEL_FILE)
+            hotel_map = df_hotels.drop_duplicates(subset=["data_id"]).set_index("data_id")["rating_rata2"].to_dict()
+            df["rating_penginapan"] = df["data_id"].astype(str).map(hotel_map)
+            changed = True
+
+        # Format rating_bintang ke desimal (contoh: 5.0, 4.0)
+        if "rating_bintang" in df.columns:
+            def to_decimal_str(x):
+                try:
+                    return f"{float(x):.1f}"
+                except Exception:
+                    return ""
+            df["rating_bintang"] = df["rating_bintang"].apply(to_decimal_str)
+            changed = True
+
         if "fasilitas" not in df.columns:
             df["fasilitas"] = ""
             changed = True
@@ -215,10 +276,13 @@ def migrate_checkpoint_schema():
             if col not in df.columns:
                 df[col] = ""
                 changed = True
+            elif df[col].dtype == object:
+                df[col] = df[col].apply(clean_csv_cell)
+                changed = True
         if changed:
             df = df[CSV_COLUMNS]
             df.to_csv(OUTPUT_REVIEW_FILE, index=False, encoding="utf-8")
-            print("✅ Skema checkpoint berhasil disesuaikan dengan kolom 'fasilitas' & 'balasan_pemilik'.")
+            print("✅ Skema checkpoint berhasil diperbarui dengan kolom 'rating_penginapan' & format rating berdesimal.")
     except Exception as e:
         print(f"⚠️ Catatan migrasi schema: {e}")
 
@@ -272,6 +336,9 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
             for r in df_old.to_dict("records"):
                 rid = str(r.get("review_id", "")).strip()
                 if rid:
+                    for k in r:
+                        if isinstance(r[k], str):
+                            r[k] = clean_csv_cell(r[k])
                     all_reviews_dict[rid] = r
             hotel_review_counts = df_old["data_id"].dropna().astype(str).value_counts().to_dict()
             if "fasilitas" in df_old.columns:
@@ -369,6 +436,11 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
             url = hotel.get("url", "")
             raw_total_est = hotel.get("jumlah_ulasan_total", 0)
             total_est = int(raw_total_est) if (pd.notnull(raw_total_est) and raw_total_est > 0) else 0
+            hotel_rating_raw = hotel.get("rating_rata2")
+            try:
+                rating_penginapan = round(float(hotel_rating_raw), 1) if pd.notnull(hotel_rating_raw) else ""
+            except Exception:
+                rating_penginapan = ""
 
             # Hitung target spesifik hotel ini
             if max_ulasan_per_hotel and max_ulasan_per_hotel > 0:
@@ -404,11 +476,30 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
                 except Exception:
                     pass
 
-                # Sinkronkan fasilitas untuk semua ulasan hotel ini di database jika ada
-                if fasilitas_str:
+                # Ekstraksi fallback rating_penginapan langsung dari Ringkasan Google Maps jika belum ada
+                if not rating_penginapan:
+                    try:
+                        live_rat = page.evaluate("""() => {
+                            const el = document.querySelector('div.jANrlb .fontDisplayLarge, span.ceNzKf, div.F7nice span[aria-hidden="true"], div.fontDisplayLarge');
+                            if (el) {
+                                const m = (el.innerText || '').match(/(\\d+[.,]\\d+)/);
+                                if (m) return m[1].replace(',', '.');
+                            }
+                            return '';
+                        }""")
+                        if live_rat:
+                            rating_penginapan = round(float(live_rat), 1)
+                    except Exception:
+                        pass
+
+                # Sinkronkan fasilitas dan rating_penginapan untuk semua ulasan hotel ini di database jika ada
+                if fasilitas_str or rating_penginapan:
                     for r_item in all_reviews_dict.values():
                         if str(r_item.get("data_id")) == data_id:
-                            r_item["fasilitas"] = fasilitas_str
+                            if fasilitas_str:
+                                r_item["fasilitas"] = fasilitas_str
+                            if rating_penginapan:
+                                r_item["rating_penginapan"] = rating_penginapan
 
                 # Jika kuota ulasan hotel ini sudah tercapai sebelumnya, cukup perbarui fasilitas lalu simpan
                 if current_rev_count >= target_quota:
@@ -520,26 +611,37 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
                 hotel_replies = 0
 
                 for item in raw_items[:target_quota]:
-                    teks_ulasan = item["text"] or nama
-                    tanggal_str = item["date"]
-                    author = item["author"]
+                    teks_ulasan = clean_csv_cell(item["text"] or nama)
+                    tanggal_str = clean_csv_cell(item["date"])
+                    author = clean_csv_cell(item["author"])
                     has_reply = bool(item["has_reply"])
-                    reply_text = item["reply_text"] if has_reply else ""
+                    reply_text = clean_csv_cell(item["reply_text"]) if has_reply else ""
 
                     if has_reply:
                         hotel_replies += 1
 
-                    # Rating Bintang (angka 1-5)
-                    star_match = re.search(r"(\d+)", item["star"])
-                    rating_bintang = int(star_match.group(1)) if star_match else 5
+                    # Rating Bintang Reviewer (format desimal 1.0 - 5.0)
+                    star_match = re.search(r"(\d+(?:[.,]\d+)?)", item["star"])
+                    if star_match:
+                        try:
+                            val_f = float(star_match.group(1).replace(",", "."))
+                            rating_bintang = f"{val_f:.1f}"
+                        except Exception:
+                            rating_bintang = "5.0"
+                    else:
+                        rating_bintang = "5.0"
 
                     # Total Ulasan Reviewer
                     rev_match = re.search(r"(\d+)", item["info"].replace(".", ""))
                     reviewer_total = int(rev_match.group(1)) if rev_match else 1
 
                     # Likes
-                    like_str = item["likes"]
-                    likes_count = int(like_str) if str(like_str).isdigit() else 0
+                    like_raw = item.get("likes", 0)
+                    if isinstance(like_raw, (int, float)):
+                        likes_count = int(like_raw)
+                    else:
+                        like_m = re.search(r"(\d+)", str(like_raw).replace(".", "").replace(",", ""))
+                        likes_count = int(like_m.group(1)) if like_m else 0
 
                     # ID Ulasan Unik
                     rev_id = item["raw_id"] if item["raw_id"] else hash_review_id(teks_ulasan, author, tanggal_str)
@@ -554,6 +656,7 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
                         "fasilitas": fasilitas_str,
                         "teks_ulasan": teks_ulasan,
                         "teks_terjemahan_google": "",
+                        "rating_penginapan": rating_penginapan,
                         "rating_bintang": rating_bintang,
                         "tanggal": tanggal_str,
                         "jumlah_like": likes_count,
@@ -565,6 +668,8 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
 
                     # Deduplikasi cerdas & pengayaan ulasan lama
                     if rev_id in all_reviews_dict:
+                        if rating_penginapan and not all_reviews_dict[rev_id].get("rating_penginapan"):
+                            all_reviews_dict[rev_id]["rating_penginapan"] = rating_penginapan
                         if fasilitas_str and not all_reviews_dict[rev_id].get("fasilitas"):
                             all_reviews_dict[rev_id]["fasilitas"] = fasilitas_str
                         if has_reply and not all_reviews_dict[rev_id].get("balasan_pemilik"):
@@ -572,21 +677,27 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
                             all_reviews_dict[rev_id]["ada_balasan_pemilik"] = True
                         if len(teks_ulasan) > len(str(all_reviews_dict[rev_id].get("teks_ulasan", ""))):
                             all_reviews_dict[rev_id]["teks_ulasan"] = teks_ulasan
+                        if likes_count > int(all_reviews_dict[rev_id].get("jumlah_like", 0) or 0):
+                            all_reviews_dict[rev_id]["jumlah_like"] = likes_count
                     else:
                         all_reviews_dict[rev_id] = record
                         hotel_added += 1
 
-                # Sinkronkan fasilitas untuk semua ulasan hotel ini di database
-                if fasilitas_str:
-                    for r_item in all_reviews_dict.values():
-                        if str(r_item.get("data_id")) == data_id:
+                # Sinkronkan fasilitas dan rating_penginapan untuk semua ulasan hotel ini di database
+                for r_item in all_reviews_dict.values():
+                    if str(r_item.get("data_id")) == data_id:
+                        if fasilitas_str:
                             r_item["fasilitas"] = fasilitas_str
+                        if rating_penginapan:
+                            r_item["rating_penginapan"] = rating_penginapan
 
                 # 5. Simpan Checkpoint ke File CSV (Streaming per hotel)
                 df_to_save = pd.DataFrame(list(all_reviews_dict.values()))
                 for c in CSV_COLUMNS:
                     if c not in df_to_save.columns:
                         df_to_save[c] = ""
+                    elif df_to_save[c].dtype == object:
+                        df_to_save[c] = df_to_save[c].apply(clean_csv_cell)
                 df_to_save = df_to_save[CSV_COLUMNS]
                 df_to_save.to_csv(OUTPUT_REVIEW_FILE, index=False, encoding="utf-8")
 
