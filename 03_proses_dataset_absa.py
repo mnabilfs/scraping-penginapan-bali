@@ -318,30 +318,112 @@ def proses_pipeline():
     print(f"✅ File CSV akhir tersimpan: {OUTPUT_CSV}")
 
     # 5. Siapkan Sheet-Sheet untuk File Excel Lengkap
-    # Sheet 1: ulasan (26 Kolom Utama Sesuai Gambar Header)
-    kolom_ulasan_26 = [
-        "place_id", "data_id", "nama_tempat", "alamat", "kategori",
+    # Sheet 1: ulasan (Semua Kolom Profil Penginapan + Detail Ulasan + Fasilitas)
+    kolom_ulasan_lengkap = [
+        "place_id", "data_id", "nama_tempat", "kategori", "alamat", "kabupaten",
+        "kelompok_sampel", "area_query", "kab_query", "query_sumber", "kata_kunci", "url",
         "rating_tempat", "total_ulasan_tempat", "harga", "telepon", "website",
-        "latitude", "longitude", "status_halal", "bukti_halal", "review_id",
-        "reviewer_total_ulasan", "rating_ulasan", "tanggal", "iso_date",
-        "ulasan", "likes", "label_halal_nama", "teks_ulasan", "tanggal_iso",
-        "teks_bersih", "bahasa"
+        "latitude", "longitude", "fasilitas", "status_halal", "bukti_halal", "label_halal_nama",
+        "review_id", "reviewer_total_ulasan", "rating_ulasan", "tanggal", "iso_date",
+        "ulasan", "teks_bersih", "teks_terjemahan_google", "likes", "ada_balasan_pemilik",
+        "balasan_pemilik", "bahasa", "sumber"
     ]
-    for c in kolom_ulasan_26:
+    for c in kolom_ulasan_lengkap:
         if c not in df_full.columns:
-            df_full[c] = ""
-    df_ulasan_sheet = df_full[kolom_ulasan_26].copy()
+            # Map kolom yang mungkin ada di df_hotel
+            if c in df_hotel.columns:
+                df_full[c] = df_full["data_id"].map(df_hotel.set_index("data_id")[c].to_dict()).fillna("")
+            else:
+                df_full[c] = ""
+    df_ulasan_sheet = df_full[kolom_ulasan_lengkap].copy()
 
-    # Sheet 2: daftar_penginapan
-    kolom_hotel = ["place_id", "data_id", "nama_tempat", "kategori", "alamat", "rating_tempat", "total_ulasan_tempat", "status_halal", "bukti_halal", "label_halal_nama"]
-    for c in kolom_hotel:
-        if c not in df_ulasan_sheet.columns:
-            df_ulasan_sheet[c] = ""
-    df_hotel_sheet = df_ulasan_sheet.drop_duplicates(subset=["data_id"])[kolom_hotel].copy()
+    # Sheet 2: daftar_penginapan (Profil Lengkap 464 Penginapan + Fasilitas)
+    kolom_hotel_lengkap = [
+        "data_id", "place_id", "nama_penginapan", "tipe", "alamat", "kabupaten",
+        "kelompok_sampel", "area_query", "kab_query", "query_sumber", "url",
+        "lat", "lon", "rating_rata2", "jumlah_ulasan_total", "harga", "telepon", "website",
+        "fasilitas", "status_halal", "bukti_halal", "label_halal_nama"
+    ]
+    status_map = df_full.drop_duplicates("data_id").set_index("data_id")["status_halal"].to_dict()
+    bukti_map = df_full.drop_duplicates("data_id").set_index("data_id")["bukti_halal"].to_dict()
+    halal_nama_map = df_full.drop_duplicates("data_id").set_index("data_id")["label_halal_nama"].to_dict()
 
-    # Sheet 3: kalimat_aspek (df_kalimat)
+    df_hotel["status_halal"] = df_hotel["data_id"].map(status_map).fillna("tanpa_indikasi_non_halal")
+    df_hotel["bukti_halal"] = df_hotel["data_id"].map(bukti_map).fillna("")
+    df_hotel["label_halal_nama"] = df_hotel["data_id"].map(halal_nama_map).fillna(False)
 
-    # Sheet 4: kamus_aspek
+    for c in kolom_hotel_lengkap:
+        if c not in df_hotel.columns:
+            df_hotel[c] = ""
+    df_hotel_sheet = df_hotel[kolom_hotel_lengkap].copy()
+
+    # Sheet 3: olah_fasilitas (Matrix One-Hot Indicator per Penginapan)
+    TOP_FACILITIES = [
+        "Wi-Fi gratis", "AC", "Restoran", "Sarapan", "Sarapan gratis",
+        "Kolam renang luar", "Kolam renang", "Parkir gratis", "Pusat kebugaran",
+        "Spa", "Layanan kamar", "Jemputan bandara", "Layanan binatu",
+        "Cocok untuk anak-anak", "Akses ke pantai", "Bar", "Boleh bawa hewan",
+        "Bebas asap rokok", "Pusat bisnis", "Dapat diakses"
+    ]
+
+    rows_olah = []
+    for _, r in df_hotel_sheet.iterrows():
+        f_str = str(r.get("fasilitas", "")).strip()
+        f_list = [x.strip() for x in f_str.split(",") if x.strip()]
+        item = {
+            "data_id": r.get("data_id"),
+            "nama_penginapan": r.get("nama_penginapan"),
+            "tipe": r.get("tipe"),
+            "kabupaten": r.get("kabupaten"),
+            "kelompok_sampel": r.get("kelompok_sampel"),
+            "status_halal": r.get("status_halal"),
+            "rating_rata2": r.get("rating_rata2"),
+            "jumlah_ulasan_total": r.get("jumlah_ulasan_total"),
+            "harga": r.get("harga"),
+            "telepon": r.get("telepon"),
+            "website": r.get("website"),
+            "total_fasilitas": len(f_list),
+            "daftar_fasilitas": f_str
+        }
+        for tf in TOP_FACILITIES:
+            col_name = tf.lower().replace(" ", "_").replace("-", "_")
+            item[col_name] = "Ya" if tf in f_list else "Tidak"
+        rows_olah.append(item)
+
+    df_olah_fasilitas = pd.DataFrame(rows_olah)
+
+    # Sheet 4: stat_fasilitas (Rekap ranking fasilitas di Bali)
+    all_facs = set()
+    for f in df_hotel_sheet["fasilitas"]:
+        for item in str(f).split(","):
+            if item.strip():
+                all_facs.add(item.strip())
+
+    stat_rows = []
+    total_h = len(df_hotel_sheet)
+    df_hotel_sheet["rating_num"] = pd.to_numeric(df_hotel_sheet["rating_rata2"], errors="coerce")
+
+    for fac in sorted(all_facs):
+        mask = df_hotel_sheet["fasilitas"].str.contains(fac, regex=False)
+        sub = df_hotel_sheet[mask]
+        n = len(sub)
+        n_halal = (sub["kelompok_sampel"] == "halal").sum()
+        n_umum = (sub["kelompok_sampel"] != "halal").sum()
+        avg_r = sub["rating_num"].mean()
+        stat_rows.append({
+            "fasilitas": fac,
+            "jumlah_penginapan": n,
+            "persentase_penginapan": f"{n/total_h*100:.1f}%",
+            "penginapan_halal": n_halal,
+            "penginapan_umum": n_umum,
+            "rata_rata_rating": round(avg_r, 2) if pd.notnull(avg_r) else 0.0
+        })
+
+    df_stat_fasilitas = pd.DataFrame(stat_rows).sort_values(by="jumlah_penginapan", ascending=False).reset_index(drop=True)
+
+    # Sheet 5: kalimat_aspek (df_kalimat)
+
+    # Sheet 6: kamus_aspek
     kamus_rows = [{"aspek": k, "regex": v["regex"], "inti_halal": v["inti_halal"]} for k, v in KAMUS_ASPEK.items()]
     df_kamus_sheet = pd.DataFrame(kamus_rows)
 
@@ -350,8 +432,9 @@ def proses_pipeline():
         {"Keterangan": "Jumlah penginapan dalam dataset", "Nilai": len(df_hotel_sheet)},
         {"Keterangan": "Jumlah ulasan (setelah pembersihan)", "Nilai": len(df_ulasan_sheet)},
         {"Keterangan": "Jumlah pasangan kalimat-aspek", "Nilai": len(df_kalimat)},
-        {"Keterangan": "Rentang tanggal ulasan (awal)", "Nilai": str(df_ulasan_sheet['tanggal_iso'].min())},
-        {"Keterangan": "Rentang tanggal ulasan (akhir)", "Nilai": str(df_ulasan_sheet['tanggal_iso'].max())}
+        {"Keterangan": "Jumlah jenis fasilitas terdata", "Nilai": len(df_stat_fasilitas)},
+        {"Keterangan": "Rentang tanggal ulasan (awal)", "Nilai": str(df_full['tanggal_iso'].min())},
+        {"Keterangan": "Rentang tanggal ulasan (akhir)", "Nilai": str(df_full['tanggal_iso'].max())}
     ])
 
     df_stat_status_halal = df_hotel_sheet["status_halal"].value_counts().reset_index()
@@ -393,12 +476,14 @@ def proses_pipeline():
             )
         return df_out
 
-    # Tulis ke file Excel dengan beberapa sheet sekaligus
+    # Tulis ke file Excel dengan seluruh 13 sheet sekaligus
     print(f"⏳ Mengekspor ke Excel: '{OUTPUT_EXCEL}'...")
     with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl") as writer:
         sanitize_for_excel(df_ulasan_sheet).to_excel(writer, sheet_name="ulasan", index=False)
         sanitize_for_excel(df_kalimat).to_excel(writer, sheet_name="kalimat_aspek", index=False)
         sanitize_for_excel(df_hotel_sheet).to_excel(writer, sheet_name="daftar_penginapan", index=False)
+        sanitize_for_excel(df_olah_fasilitas).to_excel(writer, sheet_name="olah_fasilitas", index=False)
+        sanitize_for_excel(df_stat_fasilitas).to_excel(writer, sheet_name="stat_fasilitas", index=False)
         df_stat_ringkas.to_excel(writer, sheet_name="stat_ringkas", index=False)
         df_stat_status_halal.to_excel(writer, sheet_name="stat_status_halal", index=False)
         df_stat_aspek.to_excel(writer, sheet_name="stat_aspek", index=False)
