@@ -300,7 +300,13 @@ def ensure_google_login():
     else:
         print("✅ Sesi login Google aktif ditemukan di folder profil.")
 
-def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int = 100, hotel_filter: str = ""):
+def scrape_ulasan_penginapan(
+    headless: bool = False,
+    max_ulasan_per_hotel: int = 100,
+    hotel_filter: str = "",
+    start_index: int = None,
+    retry_incomplete: bool = False
+):
     print("=" * 65)
     print("🚀 MEMULAI TAHAP 2: SCRAPING ULASAN PENGINAPAN (FULL REVIEWS)")
     if max_ulasan_per_hotel and max_ulasan_per_hotel > 0:
@@ -326,10 +332,12 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
     migrate_checkpoint_schema()
 
     # Muat database ulasan yang sudah tersimpan
-    # Muat database ulasan yang sudah tersimpan
     all_reviews_dict = {}
     hotel_review_counts = {}
     hotels_with_facilities = set()
+    last_hotel_data_id = None
+    last_hotel_name = None
+
     if OUTPUT_REVIEW_FILE.exists():
         try:
             df_old = pd.read_csv(OUTPUT_REVIEW_FILE)
@@ -344,6 +352,12 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
             if "fasilitas" in df_old.columns:
                 has_fac_df = df_old[df_old["fasilitas"].notna() & (df_old["fasilitas"].astype(str).str.strip() != "")]
                 hotels_with_facilities = set(has_fac_df["data_id"].dropna().astype(str).unique())
+
+            valid_rows = df_old[df_old["data_id"].notna() & (df_old["data_id"].astype(str).str.strip() != "")]
+            if len(valid_rows) > 0:
+                last_hotel_data_id = str(valid_rows.iloc[-1]["data_id"]).strip()
+                last_hotel_name = str(valid_rows.iloc[-1]["nama_penginapan"]).strip()
+
             print(f"📦 Checkpoint tersimpan: {len(all_reviews_dict)} ulasan dari {len(hotel_review_counts)} hotel ({len(hotels_with_facilities)} sudah berfasilitas).")
         except Exception as e:
             print(f"⚠️ Gagal membaca checkpoint ({e}). Memulai fresh database.")
@@ -354,44 +368,63 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
             writer.writeheader()
 
-    # Muat daftar hotel
+    # Muat daftar hotel master
     df_hotels = pd.read_csv(INPUT_HOTEL_FILE)
-    print(f"📋 Total penginapan terdaftar: {len(df_hotels)}")
+    total_master_hotels = len(df_hotels)
+    print(f"📋 Total penginapan terdaftar: {total_master_hotels}")
 
     # Filter jika user ingin scrape hotel tertentu saja
     if hotel_filter:
-        df_hotels = df_hotels[df_hotels["nama_penginapan"].str.contains(hotel_filter, case=False, na=False)]
-        print(f"🔍 Ditemukan {len(df_hotels)} hotel yang cocok dengan filter '{hotel_filter}'.")
+        df_filtered = df_hotels[df_hotels["nama_penginapan"].str.contains(hotel_filter, case=False, na=False)].copy()
+        print(f"🔍 Ditemukan {len(df_filtered)} hotel yang cocok dengan filter '{hotel_filter}'.")
+        hotels_to_process = [(idx, row) for idx, row in df_filtered.iterrows()]
+    elif retry_incomplete:
+        print("🔄 Mode '--retry-incomplete' aktif: Memeriksa kembali hotel lama yang ulasannya kurang dari target kuota.")
+        hotels_to_process = []
+        for idx, row in df_hotels.iterrows():
+            d_id = str(row.get("data_id", ""))
+            current_rev_count = hotel_review_counts.get(d_id, 0)
+            total_est = row.get("jumlah_ulasan_total", 0)
+            if pd.notnull(total_est) and total_est == 0:
+                continue
+            if max_ulasan_per_hotel and max_ulasan_per_hotel > 0:
+                target_quota = min(int(total_est), max_ulasan_per_hotel) if (pd.notnull(total_est) and total_est > 0) else max_ulasan_per_hotel
+            else:
+                target_quota = int(total_est) if (pd.notnull(total_est) and total_est > 0) else 100
+            has_fac = d_id in hotels_with_facilities
+            if current_rev_count >= target_quota and has_fac:
+                continue
+            hotels_to_process.append((idx, row))
+    else:
+        # Default: Lanjutkan secara sekuensial dari posisi hotel setelah checkpoint terakhir
+        start_from_idx = 0
+        if start_index is not None and start_index > 0:
+            start_from_idx = max(0, min(start_index - 1, total_master_hotels - 1))
+            target_name = df_hotels.iloc[start_from_idx]["nama_penginapan"]
+            print(f"👉 Manual start diaktifkan: Memulai langsung dari [Hotel {start_from_idx + 1}/{total_master_hotels}] {target_name}")
+        elif last_hotel_data_id:
+            matches = df_hotels.index[df_hotels["data_id"].astype(str) == last_hotel_data_id].tolist()
+            if matches:
+                last_idx = matches[-1]
+                start_from_idx = last_idx + 1
+                print(f"📦 Checkpoint terakhir di CSV: [Hotel {last_idx + 1}/{total_master_hotels}] {last_hotel_name}")
+                if start_from_idx < total_master_hotels:
+                    next_hotel_name = df_hotels.iloc[start_from_idx]["nama_penginapan"]
+                    print(f"⏩ Melanjutkan otomatis dari hotel berikutnya: [Hotel {start_from_idx + 1}/{total_master_hotels}] {next_hotel_name}")
+                else:
+                    print(f"🎉 Semua {total_master_hotels} penginapan sudah selesai diproses sampai nomor terakhir!")
+                    return
+            else:
+                print("ℹ️ Hotel terakhir tidak ditemukan di daftar master. Memulai dari awal...")
 
-    # Filter hotel yang perlu diproses / dilengkapi ulasannya / diambil fasilitasnya
-    hotels_to_process = []
-    for idx, row in df_hotels.iterrows():
-        d_id = str(row.get("data_id", ""))
-        current_rev_count = hotel_review_counts.get(d_id, 0)
-        total_est = row.get("jumlah_ulasan_total", 0)
+        hotels_to_process = []
+        for idx in range(start_from_idx, total_master_hotels):
+            hotels_to_process.append((idx, df_hotels.iloc[idx]))
 
-        # Jika hotel memiliki 0 ulasan di Google Maps, lewati
-        if pd.notnull(total_est) and total_est == 0:
-            continue
+    print(f"🎯 Sisa penginapan yang akan diproses: {len(hotels_to_process)} hotel")
 
-        # Hitung kuota target hotel
-        if max_ulasan_per_hotel and max_ulasan_per_hotel > 0:
-            target_quota = min(int(total_est), max_ulasan_per_hotel) if (pd.notnull(total_est) and total_est > 0) else max_ulasan_per_hotel
-        else:
-            target_quota = int(total_est) if (pd.notnull(total_est) and total_est > 0) else 100
-
-        # Jika sudah mencapai target kuota ulasan DAN sudah ada fasilitasnya, lewati
-        has_fac = d_id in hotels_with_facilities
-        if current_rev_count >= target_quota and has_fac:
-            continue
-
-        hotels_to_process.append(row)
-
-    df_todo = pd.DataFrame(hotels_to_process)
-    print(f"🎯 Sisa penginapan yang akan diproses / dilengkapi ulasannya: {len(df_todo)}")
-
-    if len(df_todo) == 0:
-        print("🎉 Semua penginapan sudah memiliki ulasan lengkap hingga kuota target dan berfasilitas!")
+    if len(hotels_to_process) == 0:
+        print("🎉 Semua penginapan sudah selesai diproses!")
         return
 
     with sync_playwright() as p:
@@ -427,7 +460,7 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
 
         total_new_reviews = 0
 
-        for h_idx, (_, hotel) in enumerate(df_todo.iterrows(), start=1):
+        for h_counter, (global_idx, hotel) in enumerate(hotels_to_process, start=1):
             data_id = str(hotel.get("data_id", ""))
             nama = str(hotel.get("nama_penginapan", ""))
             kabupaten = str(hotel.get("kabupaten", ""))
@@ -448,11 +481,19 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
             else:
                 target_quota = total_est if total_est > 0 else 100
 
-            print(f"\n🏨 [Hotel {h_idx}/{len(df_todo)}] {nama} ({total_est} ulasan)")
+            hotel_display_num = global_idx + 1
+            print(f"\n🏨 [Hotel {hotel_display_num}/{total_master_hotels}] {nama} ({total_est} ulasan)")
 
             if not url or pd.isnull(url):
                 print("   ⚠️ URL tidak valid. Melewati hotel ini.")
                 continue
+
+            if total_est == 0:
+                print("   ℹ️ Hotel tercatat memiliki 0 ulasan di Google Maps. Melewati...")
+                continue
+
+            current_rev_count = hotel_review_counts.get(data_id, 0)
+            has_fac = data_id in hotels_with_facilities
 
             try:
                 page.goto(url, timeout=30000, wait_until="domcontentloaded")
@@ -502,13 +543,7 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
                                 r_item["rating_penginapan"] = rating_penginapan
 
                 # Jika kuota ulasan hotel ini sudah tercapai sebelumnya, cukup perbarui fasilitas lalu simpan
-                if current_rev_count >= target_quota:
-                    df_to_save = pd.DataFrame(list(all_reviews_dict.values()))
-                    for c in CSV_COLUMNS:
-                        if c not in df_to_save.columns:
-                            df_to_save[c] = ""
-                    df_to_save = df_to_save[CSV_COLUMNS]
-                    df_to_save.to_csv(OUTPUT_REVIEW_FILE, index=False, encoding="utf-8")
+                if retry_incomplete and current_rev_count >= target_quota and has_fac:
                     fac_info = f" ({len(fac_list)} fasilitas terdata)" if fac_list else ""
                     print(f"   ✅ Fasilitas diperbarui{fac_info}. Kuota ulasan sudah lengkap ({current_rev_count} ulasan).")
                     continue
@@ -609,6 +644,7 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
 
                 hotel_added = 0
                 hotel_replies = 0
+                hotel_new_records = []
 
                 for item in raw_items[:target_quota]:
                     teks_ulasan = clean_csv_cell(item["text"] or nama)
@@ -681,6 +717,7 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
                             all_reviews_dict[rev_id]["jumlah_like"] = likes_count
                     else:
                         all_reviews_dict[rev_id] = record
+                        hotel_new_records.append(record)
                         hotel_added += 1
 
                 # Sinkronkan fasilitas dan rating_penginapan untuk semua ulasan hotel ini di database
@@ -691,20 +728,27 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
                         if rating_penginapan:
                             r_item["rating_penginapan"] = rating_penginapan
 
-                # 5. Simpan Checkpoint ke File CSV (Streaming per hotel)
-                df_to_save = pd.DataFrame(list(all_reviews_dict.values()))
-                for c in CSV_COLUMNS:
-                    if c not in df_to_save.columns:
-                        df_to_save[c] = ""
-                    elif df_to_save[c].dtype == object:
-                        df_to_save[c] = df_to_save[c].apply(clean_csv_cell)
-                df_to_save = df_to_save[CSV_COLUMNS]
-                df_to_save.to_csv(OUTPUT_REVIEW_FILE, index=False, encoding="utf-8")
+                # 5. Simpan Checkpoint ke File CSV (Fast Append per hotel)
+                if hotel_new_records:
+                    with open(OUTPUT_REVIEW_FILE, "a", newline="", encoding="utf-8") as f_out:
+                        writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS)
+                        for rec in hotel_new_records:
+                            row_dict = {c: clean_csv_cell(rec.get(c, "")) for c in CSV_COLUMNS}
+                            writer.writerow(row_dict)
+                elif retry_incomplete:
+                    df_to_save = pd.DataFrame(list(all_reviews_dict.values()))
+                    for c in CSV_COLUMNS:
+                        if c not in df_to_save.columns:
+                            df_to_save[c] = ""
+                        elif df_to_save[c].dtype == object:
+                            df_to_save[c] = df_to_save[c].apply(clean_csv_cell)
+                    df_to_save = df_to_save[CSV_COLUMNS]
+                    df_to_save.to_csv(OUTPUT_REVIEW_FILE, index=False, encoding="utf-8")
 
                 total_new_reviews += hotel_added
                 tot_for_hotel = sum(1 for r in all_reviews_dict.values() if r.get("data_id") == data_id)
                 fac_info = f" | {len(fac_list)} fasilitas terdata" if fac_list else ""
-                print(f"   ✅ Selesai: {tot_for_hotel} ulasan tersimpan ({hotel_replies} memiliki balasan pemilik{fac_info}).")
+                print(f"   ✅ Selesai: {hotel_added} ulasan baru tersimpan (Total hotel ini: {tot_for_hotel} ulasan | {hotel_replies} memiliki balasan pemilik{fac_info}).")
 
             except Exception as e_hotel:
                 print(f"   ⚠️ Terjadi kesalahan saat scraping hotel ({e_hotel}). Melanjutkan...")
@@ -717,12 +761,21 @@ def scrape_ulasan_penginapan(headless: bool = False, max_ulasan_per_hotel: int =
     print(f"📁 Database ulasan tersimpan: {len(all_reviews_dict)} ulasan di {OUTPUT_REVIEW_FILE}")
     print("=" * 65)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scraping Ulasan Penginapan Google Maps")
     parser.add_argument("--max", "-m", type=int, default=100, help="Target ulasan per hotel (default: 100, set 0 untuk semua)")
     parser.add_argument("--hotel", type=str, default="", help="Filter nama hotel tertentu (misal: Cicada)")
     parser.add_argument("--headless", action="store_true", help="Jalankan browser di background tanpa tampilan window")
+    parser.add_argument("--start", "-s", type=int, default=None, help="Mulai langsung dari nomor urut penginapan tertentu (misal: 237)")
+    parser.add_argument("--retry-incomplete", action="store_true", help="Ulangi hotel-hotel sebelumnya yang ulasannya belum mencapai target kuota")
     args = parser.parse_args()
 
     max_target = None if args.max <= 0 else args.max
-    scrape_ulasan_penginapan(headless=args.headless, max_ulasan_per_hotel=max_target, hotel_filter=args.hotel)
+    scrape_ulasan_penginapan(
+        headless=args.headless,
+        max_ulasan_per_hotel=max_target,
+        hotel_filter=args.hotel,
+        start_index=args.start,
+        retry_incomplete=args.retry_incomplete
+    )
