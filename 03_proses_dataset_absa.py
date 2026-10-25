@@ -19,6 +19,8 @@ from langdetect import detect
 # Pastikan output konsol Windows mendukung UTF-8
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -171,6 +173,7 @@ def proses_pipeline():
 
         nama_tempat = str(row.get("nama_penginapan") or h_info.get("nama_penginapan", ""))
         alamat = str(h_info.get("alamat", ""))
+        kategori = str(h_info.get("tipe", "Hotel"))
         raw_hotel_rat = row.get("rating_penginapan") if (pd.notnull(row.get("rating_penginapan")) and str(row.get("rating_penginapan")).strip() != "") else h_info.get("rating_rata2")
         try:
             rating_tempat = f"{float(raw_hotel_rat):.1f}" if pd.notnull(raw_hotel_rat) and str(raw_hotel_rat).strip() != "" else ""
@@ -355,7 +358,9 @@ def proses_pipeline():
     df_stat_status_halal.columns = ["status_halal", "jumlah_penginapan"]
 
     if not df_kalimat.empty:
-        df_stat_aspek = df_kalimat.groupby("aspek").agg(
+        df_kalimat_stat = df_kalimat.copy()
+        df_kalimat_stat["rating_ulasan"] = pd.to_numeric(df_kalimat_stat["rating_ulasan"], errors="coerce")
+        df_stat_aspek = df_kalimat_stat.groupby("aspek").agg(
             jumlah_kalimat=("kalimat", "count"),
             jumlah_ulasan=("review_id", "nunique"),
             rata_rata_rating=("rating_ulasan", "mean")
@@ -372,7 +377,9 @@ def proses_pipeline():
     df_stat_tahun = df_absa_csv["tahun"].value_counts().reset_index()
     df_stat_tahun.columns = ["tahun", "jumlah_ulasan"]
 
-    df_stat_penginapan = df_ulasan_sheet.groupby(["data_id", "nama_tempat", "status_halal"]).agg(
+    df_ulasan_num = df_ulasan_sheet.copy()
+    df_ulasan_num["rating_ulasan"] = pd.to_numeric(df_ulasan_num["rating_ulasan"], errors="coerce")
+    df_stat_penginapan = df_ulasan_num.groupby(["data_id", "nama_tempat", "status_halal"]).agg(
         jumlah_ulasan=("review_id", "count"),
         rata_rata_rating=("rating_ulasan", "mean")
     ).round(2).reset_index()

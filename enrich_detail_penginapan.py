@@ -3,6 +3,12 @@ Enricher Metadata Penginapan Google Maps:
 Mengisi kolom `alamat`, `telepon`, `website`, dan `harga` yang masih kosong di `data/daftar_penginapan_bali_mentah.csv`.
 """
 
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import re
 import time
 from pathlib import Path
@@ -22,6 +28,58 @@ def clean_icon_text(txt: str) -> str:
     cleaned = re.sub(r"[\ue000-\uf8ff]", "", txt).strip()
     return cleaned
 
+def to_usd_price(raw_price: str) -> str:
+    """Mengonversi teks harga (SGD/IDR/USD) ke format standar USD (contoh: 'USD 15')."""
+    if not raw_price:
+        return ""
+    
+    txt = clean_icon_text(raw_price).replace('\xa0', ' ').replace('\u2009', ' ').strip()
+    
+    # 1. Jika dalam SGD (contoh: 'SGD 19', 'SGD 439')
+    m_sgd = re.search(r'SGD\s*([\d.,]+)', txt, re.IGNORECASE)
+    if m_sgd:
+        val_str = m_sgd.group(1).replace(',', '')
+        try:
+            val_sgd = float(val_str)
+            val_usd = round(val_sgd * 0.77)  # 1 SGD ~ 0.77 USD
+            return f"USD {val_usd}"
+        except Exception:
+            return f"USD {val_str}"
+            
+    # 2. Jika dalam IDR / Rp (contoh: 'Rp 228.536', 'IDR 6,270,239')
+    m_idr = re.search(r'(?:Rp|IDR)\s*([\d.,]+)', txt, re.IGNORECASE)
+    if m_idr:
+        num_str = re.sub(r'[.,]', '', m_idr.group(1))
+        try:
+            val_idr = float(num_str)
+            val_usd = round(val_idr / 15600)  # 1 USD ~ 15,600 IDR
+            return f"USD {val_usd}"
+        except Exception:
+            pass
+
+    # 3. Jika sudah USD / $
+    m_usd = re.search(r'(?:USD|\$)\s*([\d.,]+)', txt, re.IGNORECASE)
+    if m_usd:
+        return f"USD {m_usd.group(1).strip()}"
+        
+    return txt
+
+def save_csv_safely(df_to_save: pd.DataFrame, file_path: Path):
+    """Menyimpan dataframe ke CSV dengan aman (mencegah error jika file dibuka di Microsoft Excel)."""
+    try:
+        df_to_save.to_csv(file_path, index=False, encoding="utf-8")
+    except PermissionError:
+        print(f"\n⚠️ PERINGATAN: File '{file_path.name}' sedang terbuka di aplikasi lain (seperti Microsoft Excel)!")
+        print("⚠️ Harap tutup file tersebut agar perubahan dapat disimpan permanen.")
+        backup_path = file_path.with_name(f"{file_path.stem}_backup.csv")
+        try:
+            df_to_save.to_csv(backup_path, index=False, encoding="utf-8")
+            print(f"💾 Progres otomatis diamankan sementara di: {backup_path.name}")
+        except Exception:
+            pass
+
+USER_DATA_DIR = DATA_DIR / "browser_profile"
+
 def enrich_hotels(headless: bool = True):
     if not HOTEL_FILE.exists():
         print(f"File {HOTEL_FILE} tidak ditemukan!")
@@ -30,8 +88,14 @@ def enrich_hotels(headless: bool = True):
     df = pd.read_csv(HOTEL_FILE)
     print(f"📋 Total penginapan: {len(df)}")
 
+    # Pastikan kolom ada dan bertipe object/string agar pandas tidak melempar TypeError float64
+    for col in ["harga", "telepon", "website", "alamat"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].astype("object").fillna("")
+
     # Cari baris yang telepon atau websitenya masih kosong
-    mask_empty = df["telepon"].isnull() | (df["telepon"] == "") | df["website"].isnull() | (df["website"] == "")
+    mask_empty = (df["telepon"] == "") | (df["website"] == "")
     hotels_to_enrich = df[mask_empty].copy()
     print(f"🎯 Penginapan yang perlu dilengkapi (telepon/web): {len(hotels_to_enrich)}")
 
@@ -40,11 +104,43 @@ def enrich_hotels(headless: bool = True):
         return
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=["--lang=id-ID,id"])
-        page = browser.new_page()
+        USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # Gunakan profil browser asli yang sudah login agar tidak terkena blokir Google
+        launch_args = [
+            "--lang=id-ID,id",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox"
+        ]
+        try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(USER_DATA_DIR),
+                channel="chrome",
+                headless=headless,
+                args=launch_args,
+                viewport={"width": 1400, "height": 900},
+                locale="id-ID"
+            )
+        except Exception:
+            # Fallback ke Playwright Chromium jika Google Chrome sistem sedang terbuka/terkunci
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(USER_DATA_DIR),
+                headless=headless,
+                args=launch_args,
+                viewport={"width": 1400, "height": 900},
+                locale="id-ID"
+            )
 
-        # Blokir gambar untuk loading cepat
-        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+        page = context.pages[0] if context.pages else context.new_page()
+
+        # Blokir file gambar & media agar cepat
+        def intercept_heavy(route):
+            if route.request.resource_type in ["image", "media"]:
+                route.abort()
+            else:
+                route.continue_()
+
+        page.route("**/*", intercept_heavy)
 
         count = 0
         for idx, row in tqdm(hotels_to_enrich.iterrows(), total=len(hotels_to_enrich), desc="Melengkapi Detail Hotel"):
@@ -53,47 +149,113 @@ def enrich_hotels(headless: bool = True):
                 continue
 
             try:
-                page.goto(url, timeout=20000, wait_until="domcontentloaded")
-                time.sleep(1.0)
+                page.goto(url, timeout=25000, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_selector('div.m6QErb', timeout=6000)
+                except Exception:
+                    pass
+                time.sleep(1.5)
 
-                details = page.evaluate("""() => {
-                    const addrEl = document.querySelector('button[data-item-id="address"]');
-                    const phoneEl = document.querySelector('button[data-item-id*="phone"]');
-                    const webEl = document.querySelector('a[data-item-id="authority"]');
-                    const priceEl = document.querySelector('span[aria-label*="per malam"], div.drwW4b, span.fontTitleLarge, div[aria-label*="IDR"], div[aria-label*="Rp"]');
-                    return {
-                        alamat: addrEl ? addrEl.innerText.trim() : '',
-                        telepon: phoneEl ? phoneEl.innerText.trim() : '',
-                        website: webEl ? webEl.getAttribute('href') : '',
-                        harga: priceEl ? priceEl.innerText.trim() : ''
-                    };
+                details = page.evaluate(r"""() => {
+                    // 1. Alamat
+                    let alamat = '';
+                    const addrEl = document.querySelector('button[data-item-id="address"], button[aria-label*="Alamat:"]');
+                    if (addrEl) {
+                        const aria = addrEl.getAttribute('aria-label') || '';
+                        alamat = aria.replace(/^Alamat:\s*/i, '').trim() || addrEl.innerText.trim();
+                    }
+
+                    // 2. Telepon
+                    let telepon = '';
+                    const phoneEl = document.querySelector('button[data-item-id*="phone"], button[aria-label*="Telepon:"], a[href^="tel:"]');
+                    if (phoneEl) {
+                        const aria = phoneEl.getAttribute('aria-label') || '';
+                        telepon = aria.replace(/^Telepon:\s*/i, '').trim() || phoneEl.innerText.trim();
+                        telepon = telepon.replace(/^tel:\+?/i, '').trim();
+                    }
+
+                    // 3. Website
+                    let website = '';
+                    const webEl = document.querySelector('a[data-item-id="authority"], a[aria-label*="Situs Web" i], a[aria-label*="Website" i], a[data-tooltip*="situs web" i]');
+                    if (webEl) {
+                        let href = webEl.getAttribute('href') || '';
+                        const m = href.match(/[?&]q=([^&]+)/);
+                        if (m) {
+                            try { href = decodeURIComponent(m[1]); } catch(e){}
+                        }
+                        website = href;
+                    }
+
+                    // 4. Harga (jika tersedia di Google Hotels / Partners)
+                    let harga = '';
+                    const priceEl = document.querySelector('button[aria-label*="per malam"], *[aria-label*="per malam"], div.drwW4b, div[aria-label*="Rp"], span[aria-label*="Rp"], .fontTitleLarge');
+                    if (priceEl) {
+                        const aria = priceEl.getAttribute('aria-label') || '';
+                        const txt = priceEl.innerText || '';
+                        const mDari = aria.match(/Dari\s+([^per]+?)\s+per\s+malam/i);
+                        if (mDari) {
+                            harga = mDari[1].trim();
+                        } else {
+                            const m = (aria + ' ' + txt).match(/(?:Rp|IDR|SGD|USD|AUD|EUR|[$€¥])\s*[\d.,]+/i);
+                            if (m) harga = m[0];
+                        }
+                    }
+                    if (!harga) {
+                        for (let el of document.querySelectorAll('button, span, div')) {
+                            const t = (el.innerText || '').trim();
+                            if (/^(?:Rp|IDR|SGD|USD)\s*[\d.,]+$/i.test(t) && t.length < 25) {
+                                harga = t;
+                                break;
+                            }
+                        }
+                    }
+
+                    return { alamat, telepon, website, harga };
                 }""")
 
                 # Update jika ditemukan
-                if details["alamat"] and (pd.isnull(df.at[idx, "alamat"]) or df.at[idx, "alamat"] == ""):
-                    df.at[idx, "alamat"] = clean_icon_text(details["alamat"])
-                if details["telepon"] and (pd.isnull(df.at[idx, "telepon"]) or df.at[idx, "telepon"] == ""):
+                curr_alamat = str(df.at[idx, "alamat"]).strip()
+                hotel_name = str(row.get("nama_penginapan", "")).strip().lower()
+                if details["alamat"]:
+                    # Update alamat jika masih kosong atau hanya berisi nama hotel
+                    if not curr_alamat or curr_alamat.lower() == hotel_name:
+                        df.at[idx, "alamat"] = clean_icon_text(details["alamat"])
+
+                val_tel = str(df.at[idx, "telepon"]).strip()
+                if details["telepon"] and (not val_tel or val_tel.lower() == "nan"):
                     df.at[idx, "telepon"] = clean_icon_text(details["telepon"])
-                if details["website"] and (pd.isnull(df.at[idx, "website"]) or df.at[idx, "website"] == ""):
+
+                val_web = str(df.at[idx, "website"]).strip()
+                if details["website"] and (not val_web or val_web.lower() == "nan"):
                     df.at[idx, "website"] = details["website"]
-                if details["harga"] and (pd.isnull(df.at[idx, "harga"]) or df.at[idx, "harga"] == ""):
-                    df.at[idx, "harga"] = clean_icon_text(details["harga"])
+
+                val_hrg = str(df.at[idx, "harga"]).strip()
+                if details["harga"] and (not val_hrg or val_hrg.lower() == "nan"):
+                    df.at[idx, "harga"] = to_usd_price(details["harga"])
 
                 count += 1
-                # Simpan berkala setiap 10 hotel
-                if count % 10 == 0:
-                    df.to_csv(HOTEL_FILE, index=False, encoding="utf-8")
+                # Simpan berkala setiap 5 hotel
+                if count % 5 == 0:
+                    save_csv_safely(df, HOTEL_FILE)
 
             except Exception:
                 continue
 
-        browser.close()
+        context.close()
 
-    df.to_csv(HOTEL_FILE, index=False, encoding="utf-8")
+    save_csv_safely(df, HOTEL_FILE)
+    
+    total_tel = (df["telepon"].astype(str).str.strip() != "").sum()
+    total_web = (df["website"].astype(str).str.strip() != "").sum()
+    total_hrg = (df["harga"].astype(str).str.strip() != "").sum()
     print("\n" + "=" * 60)
     print("✅ Berhasil melengkapi metadata penginapan!")
+    print(f"📞 Total penginapan bertelepon: {total_tel}/{len(df)}")
+    print(f"🌐 Total penginapan berwebsite: {total_web}/{len(df)}")
+    print(f"💰 Total penginapan berharga:   {total_hrg}/{len(df)}")
     print(f"📁 Disimpan di: {HOTEL_FILE}")
     print("=" * 60)
 
 if __name__ == "__main__":
     enrich_hotels(headless=True)
+
